@@ -1,0 +1,51 @@
+{
+  "name": "dsh-all-over-chinese-to-english",
+  "version": "1.0.0",
+  "private": false,
+  "description": "Translates Chinese text across the DSH interface - plugin pages, settings, dropdown menus, plugin view tabs and iframe panels - into English.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Abdelrhman Bishr",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abdelrhmanwaelbishr/dsh-all-over-chinese-to-english.git"
+  },
+  "homepage": "https://github.com/abdelrhmanwaelbishr/dsh-all-over-chinese-to-english#readme",
+  "bugs": {
+    "url": "https://github.com/abdelrhmanwaelbishr/dsh-all-over-chinese-to-english/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "translation",
+    "chinese",
+    "localization"
+  ],
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  }
+}

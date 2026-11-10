@@ -1,0 +1,12 @@
+# The translator service is shipped with dsh but opt-in (experimental package).
+# Mount it here so the All-Over Chinese to English host plugin can use free Bing/Google routes.
+- insert:
+    - id: all-over-chinese-to-english-translator
+      name: '@deepseek-ai/dsh-experimental-translator'
+      config: {}
+
+    - id: all-over-chinese-to-english
+      name: 'dsh-all-over-chinese-to-english'
+      config:
+        enabled: true
+        targetLanguage: en
