@@ -22,6 +22,115 @@ function remember(text, translation) {
   cache.set(text, translation)
 }
 
+// User interface and agent status text is short, imperative and repetitive.
+// Generic machine translation renders the same label several ways ("verify",
+// "validate", "measure"), so the most common ones get a fixed reading. Only
+// whole segments are replaced: inside a longer sentence the translator still
+// decides, which keeps the sentence grammatical.
+const GLOSSARY = new Map([
+  ['实时状态', 'Live status'],
+  ['状态栏', 'Status bar'],
+  ['状态', 'Status'],
+  ['插件设置', 'Plugin settings'],
+  ['设置', 'Settings'],
+  ['插件', 'Plugin'],
+  ['对话', 'Chat'],
+  ['会话', 'Session'],
+  ['模型', 'Model'],
+  ['工具', 'Tools'],
+  ['权限', 'Permissions'],
+  ['工作区', 'Workspace'],
+  ['翻译', 'Translation'],
+  ['已启用', 'Enabled'],
+  ['已禁用', 'Disabled'],
+  ['启用', 'Enable'],
+  ['禁用', 'Disable'],
+  ['保存', 'Save'],
+  ['取消', 'Cancel'],
+  ['确认', 'Confirm'],
+  ['删除', 'Delete'],
+  ['复制', 'Copy'],
+  ['重试', 'Retry'],
+  ['刷新', 'Refresh'],
+  ['关闭', 'Close'],
+  ['打开', 'Open'],
+  ['完成', 'Done'],
+  ['失败', 'Failed'],
+  ['成功', 'Done'],
+  ['加载中', 'Loading'],
+  ['正在加载', 'Loading'],
+  ['暂停', 'Pause'],
+  ['继续', 'Resume'],
+  ['重命名', 'Rename'],
+  ['验证', 'Verify'],
+  ['应用', 'Apply'],
+  ['定位', 'Locate'],
+  ['排查', 'Investigate'],
+  ['复测', 'Re-measure'],
+  ['量化', 'Quantify'],
+  ['确认', 'Confirm'],
+  ['确认中', 'Confirming'],
+  ['检查', 'Check'],
+  ['修复', 'Fix'],
+  ['调整', 'Adjust'],
+  ['重建', 'Rebuild'],
+  ['生成', 'Generate'],
+  ['下载', 'Download'],
+  ['上传', 'Upload'],
+  ['导入', 'Import'],
+  ['导出', 'Export'],
+  ['安装', 'Install'],
+  ['卸载', 'Uninstall'],
+  ['更新', 'Update'],
+  ['编辑', 'Edit'],
+  ['搜索', 'Search'],
+  ['过滤', 'Filter'],
+  ['排序', 'Sort'],
+  ['归档', 'Archive'],
+  ['回收站', 'Trash'],
+  ['历史记录', 'History'],
+  ['主理鱼', 'Maintainer'],
+])
+
+// Characters that make a fragment a machine-reading artefact rather than UI
+// text: JSON, markup, quotes, operators, and non-standard form fields.
+const NON_TEXT = /["'`{}\[\]<>\\|=\uFFFC\uFFFD]/
+
+// Sentence punctuation is kept as its own segment, so a translated paragraph is
+// rebuilt with the punctuation the author wrote instead of a run-on sentence.
+const SEPARATOR = /([，。；！？,;:：、]|\.\.\.|…)/
+
+function isSeparator(part) {
+  return SEPARATOR.test(part)
+}
+
+function splitSegments(text) {
+  return text.split(SEPARATOR).filter((part) => part !== '')
+}
+
+function applyGlossary(text) {
+  if (!text) return text
+  let changed = false
+  const mapped = splitSegments(text).map((part) => {
+    if (isSeparator(part)) return part
+    const trimmed = part.trim()
+    if (!trimmed) return part
+    const fixed = GLOSSARY.get(trimmed)
+    if (fixed === undefined) return part
+    changed = true
+    return part.replace(trimmed, fixed)
+  })
+  if (!changed) return text
+  return mapped.join('')
+}
+
+function normalizeTranslation(text, translated) {
+  if (GLOSSARY.has(text)) return GLOSSARY.get(text)
+  const glossary = applyGlossary(text)
+  if (glossary !== text) return glossary
+  return typeof translated === 'string' ? translated.trim() : ''
+}
+
 async function mapLimit(items, limit, task) {
   const results = new Array(items.length)
   let cursor = 0
@@ -126,7 +235,30 @@ function createRuntime(ctx, settings) {
 
   async function translateBatch(texts, signal) {
     const unique = [...new Set(texts)]
-    const missing = unique.filter((text) => !cache.has(text))
+
+    // Expressions the glossary already settles never leave the process.
+    const pending = []
+    for (const text of unique) {
+      if (cache.has(text)) continue
+      const fixed = normalizeTranslation(text, '')
+      if (fixed) remember(text, fixed)
+      else pending.push(text)
+    }
+
+    const missing = []
+    for (const text of pending) {
+      const fragments = splitSegments(text)
+      let settled = true
+      for (const fragment of fragments) {
+        if (isSeparator(fragment)) continue
+        const trimmed = fragment.trim()
+        if (!trimmed || GLOSSARY.has(trimmed)) continue
+        settled = false
+        if (!cache.has(trimmed)) missing.push(trimmed)
+      }
+      if (settled) remember(text, applyGlossary(text))
+    }
+
     let backend = 'cache'
 
     if (missing.length) {
@@ -135,7 +267,7 @@ function createRuntime(ctx, settings) {
         backend = 'translator'
         try {
           const translated = await translateWithService(translator, missing, signal)
-          missing.forEach((text, index) => remember(text, translated[index]))
+          missing.forEach((text, index) => remember(text, normalizeTranslation(text, translated[index])))
         } catch (error) {
           if (signal?.aborted) throw error
           backend = 'llm'
@@ -148,8 +280,26 @@ function createRuntime(ctx, settings) {
       if (stillMissing.length) {
         backend = 'llm'
         const translated = await translateWithLlm(stillMissing, signal)
-        stillMissing.forEach((text, index) => remember(text, translated[index]))
+        stillMissing.forEach((text, index) => remember(text, normalizeTranslation(text, translated[index])))
       }
+    }
+
+    // Rebuild every whole string from its segments: the punctuation the author
+    // wrote is put back, and a glossary term keeps its fixed reading whatever the
+    // backend answered for that fragment.
+    for (const text of pending) {
+      const rebuilt = splitSegments(text)
+        .map((part) => {
+          if (isSeparator(part)) return part
+          const trimmed = part.trim()
+          if (!trimmed) return part
+          if (GLOSSARY.has(trimmed)) return part.replace(trimmed, GLOSSARY.get(trimmed))
+          const translated = cache.get(trimmed)
+          if (translated === undefined) return part
+          return part.replace(trimmed, translated)
+        })
+        .join('')
+      if (rebuilt && rebuilt !== text) remember(text, rebuilt)
     }
 
     return {
@@ -194,6 +344,9 @@ function createHandler(ctx, settings, runtime) {
       if (typeof item !== 'string') continue
       const text = item.trim()
       if (!text || text.length > MAX_CHARS || !CJK.test(text)) continue
+      // Machine-reading artefacts (log lines, JSON, broken slices of a
+      // generated file) are not interface text and must not be rebuilt.
+      if (NON_TEXT.test(text)) continue
       texts.push(text)
       if (texts.length >= MAX_TEXTS) break
     }

@@ -23,17 +23,19 @@ It ships as one installable bundle with two halves.
 | Plugin Views and their top bar tabs | e.g. the `dsh-session-superagent` view and its tab label |
 | Same-origin iframe panels | The whole MCP Connector page (`<iframe src="/mcp-connector/ui/">`) |
 | Display-only attributes | `placeholder`, `title`, `aria-label`, `alt`, `label` |
+| The agent's own conversation text | Assistant messages and thinking titles such as `⏵ 验证图片是否已对齐` |
 
 ## What is deliberately left alone
 
-Chat and other conversation-content views are never scanned or translated: the chat transcript
-(`conversation.chat.flow` / `conversation.chat.node`), the Trajectory table, the Context/Fleet dashboard, the composer,
-and drafts all hold user content rather than plugin UI, and none of it is sent to a translation backend. A plugin View
-is recognised by the absence of those conversation markers inside the same `conversation.view` slot.
+Chat rows authored by the user are never scanned or translated: `data-chat-flow-kind="user"` and `"steering"` rows,
+the optimistic submission echo (`data-submission-echo`), tool output (`tool-result`), the composer and its dock, and
+everything typed into a field. The Trajectory table and the Context/Fleet dashboard render stored raw payloads
+(including user prompts and tool output), so those views stay untranslated as a whole. A plugin View is recognised by
+the absence of those conversation markers inside the same `conversation.view` slot.
 
 Also skipped: `script`, `style`, `code`, `pre`, `svg`, `canvas`, `math`, `video`, `audio`, fields where the user types
 (`input`, `textarea`, `contenteditable`), anything marked `translate="no"` or `data-atz-ignore`, and strings longer than
-400 characters. Option *values* and form-field values stay untouched, so saved configuration keeps the original value.
+800 characters. Option *values* and form-field values stay untouched, so saved configuration keeps the original value.
 
 ## Configuration
 

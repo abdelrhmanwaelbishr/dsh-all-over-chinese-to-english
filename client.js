@@ -3,14 +3,20 @@
 // Watches the DSH web UI for Chinese text that comes from installed plugins
 // (plugin cards, settings pages, dialogs, menus, descriptions, plugin views and
 // their tab labels) and replaces it with English via the plugin's host route.
-// Only the chat transcript and the composer are excluded: chat messages, tool
-// output and what the user types are user content, never plugin UI, and must
-// not be sent to a translation backend.
+// The chat transcript is translated only for what the agent itself wrote: an
+// assistant row, its thinking titles ("⏵ 验证图片是否已对齐") and its prose. A row
+// the user authored (data-chat-flow-kind=user / steering, or a submission echo)
+// and tool output are never sent to a translation backend; neither is the
+// composer or anything the user types. The Trajectory and Context views show
+// raw stored payloads, so they stay untranslated as a whole.
 window.__ModuleLoader__.load({
   id: 'dsh-all-over-chinese-to-english',
   factory(require) {
     const API_PATH = 'api/all-over-chinese-to-english'
     const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/
+    // "⏵" and friends decorate a status line. They are not words: they are cut
+    // off before a request and pasted back onto the answer.
+    const MARKER = /^[\s⏵⏴▶►»→]*/
     const SKIP_SELECTOR =
       'script,style,noscript,code,pre,textarea,input,svg,canvas,iframe,math,video,audio,[contenteditable=""],[contenteditable="true"],[translate="no"],[data-atz-ignore]'
     // Form fields keep their user content, but their display-only attributes
@@ -18,20 +24,31 @@ window.__ModuleLoader__.load({
     const ATTRIBUTE_SKIP_SELECTOR =
       'script,style,noscript,code,pre,svg,canvas,iframe,math,video,audio,[contenteditable=""],[contenteditable="true"],[translate="no"],[data-atz-ignore]'
     const EXCLUDE_SELECTOR = [
-      // Chat transcript and composer: user/model content, never plugin UI.
-      '[data-slot="conversation.chat.flow"]',
-      '[data-slot="conversation.chat.node"]',
+      // The composer and its dock: everything here is what the user is writing.
       '[data-slot="conversation.composer"]',
       '[data-slot="conversation.input.dock"]',
     ].join(',')
-    // Conversation Views (Chat, Trajectory, Context/Fleet) render user and
-    // model content. A plugin-provided view (e.g. the session superagent page)
-    // shares the same slot but none of these markers, so it can be translated.
+    // Chat flow rows the user authored, plus tool output, are user data and are
+    // never sent to a translation backend. Assistant rows and their process
+    // (thinking titles, step prose) are model output, so they are translated.
+    const CHAT_FLOW_SELECTOR = '[data-slot="conversation.chat.flow"]'
+    const CHAT_ROW_SELECTOR = '[data-chat-flow-key]'
+    const CHAT_EXCLUDED_KINDS = new Set(['user', 'steering', 'tool-result'])
+    // Conversation Views (Trajectory and the dsh-context dashes) render stored
+    // payloads, including what the user typed and tool output. A plugin-provided
+    // view (e.g. the session superagent page) shares the same slot but none of
+    // these markers, so it can be translated.
     const VIEW_SELECTOR = '[data-slot="conversation.view"]'
-    const CONVERSATION_CONTENT =
-      '[data-slot="conversation.chat.flow"],[data-trajectory-scroll],[data-lc-surface],[data-conversation-scroll]'
+    const CONVERSATION_CONTENT = '[data-trajectory-scroll],[data-lc-surface]'
+    const FLOW_SELECTOR = '[data-slot="conversation.chat.flow"]'
     const ATTRIBUTES = ['placeholder', 'title', 'aria-label', 'alt', 'label']
-    const MAX_LENGTH = 400
+    // The status line re-renders constantly: a fresh element every time the
+    // status changes or scrolls into view. Its translation is kept with the
+    // rest, so a respawn is filled in synchronously, without a flash of Chinese
+    // and without a second request.
+    // A paragraph the agent wrote is often longer than a plugin label, and the
+    // host route translates up to 800 characters per string.
+    const MAX_LENGTH = 800
     const MAX_BATCH = 60
     const MAX_CACHE = 3000
     const BATCH_DELAY = 80
@@ -65,7 +82,94 @@ window.__ModuleLoader__.load({
     function splitWhitespace(text) {
       const leading = text.length - text.replace(/^\s+/, '').length
       const trailing = text.replace(/\s+$/, '').length
-      return { lead: text.slice(0, leading), core: text.slice(leading, trailing), trail: text.slice(trailing) }
+      return { lead: text.slice(0, leading), trail: text.slice(trailing) }
+    }
+
+    // Walks a subtree by hand. The observer of a frame document belongs to the
+    // top window, and its NodeFilter is handed to that window's TreeWalker,
+    // which refuses to accept an object from another realm.
+    function collectTexts(root, out) {
+      if (!root) return out
+      if (root.nodeType === 3) {
+        out.push(root)
+        return out
+      }
+      if (root.nodeType !== 1) return out
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+      let node = walker.nextNode()
+      while (node) {
+        out.push(node)
+        node = walker.nextNode()
+      }
+      return out
+    }
+
+    // "⏵ 应用图片与卡片修复" -> { marker: "⏵ ", lead: " ", trail: "" }.
+    // The arrow is decoration, not words, and the whitespace around the words
+    // is put back exactly as it was. The words themselves are read separately
+    // by wordsOf, which also tells apart text that carries no words at all.
+    function stripMarker(value) {
+      const marker = MARKER.exec(value)[0]
+      const { lead, trail } = splitWhitespace(value.slice(marker.length))
+      return { marker, lead, trail }
+    }
+
+    // The translation unit of a display string: the words, without the arrow
+    // and without the surrounding whitespace. Empty when there are none.
+    function wordsOf(value) {
+      const marker = MARKER.exec(value)[0]
+      const rest = value.slice(marker.length)
+      const { lead, trail } = splitWhitespace(rest)
+      return rest.slice(lead.length, rest.length - trail.length)
+    }
+
+    function restoreMarker(value, translated) {
+      const { marker, lead, trail } = stripMarker(value)
+      return marker + lead + translated + trail
+    }
+
+    // Whether an element is the agent's live status line. It carries no marker
+    // of its own, so it is recognised by where it sits: message rows are slotted
+    // inside the chat flow, and the status line is the only thing mounted beside
+    // that flow inside the transcript column. Slotted elements are plugin or
+    // conversation renderers and are never treated as status.
+    function isStatusLine(element) {
+      if (!element || element.nodeType !== 1) return false
+      if (element.hasAttribute('data-slot')) return false
+      let next = element.parentElement
+      for (let depth = 0; depth < 3 && next; depth += 1) {
+        if (next === document.body || next === document.documentElement) return false
+        if (next.matches(FLOW_SELECTOR) || next.querySelector(FLOW_SELECTOR) !== null) return true
+        // Everything above the row's messages belongs to the conversation view,
+        // which is excluded as a whole.
+        if (isConversationView(next)) return false
+        next = next.parentElement
+      }
+      return false
+    }
+
+    function isConversationView(element) {
+      return element.matches(VIEW_SELECTOR) && element.querySelector(CONVERSATION_CONTENT) !== null
+    }
+
+    // True when the element only belongs to the agent's status line: the row
+    // the conversation renders below its messages (or inside the view, in a
+    // frame that mirrors it), outside the scrolling message list.
+    function isStatusRow(element) {
+      if (!element || element.nodeType !== 1) return false
+      if (!isStatusLine(element)) return false
+      const list = closestMatch(element, FLOW_SELECTOR)
+      if (list !== null) return !list.contains(element)
+      return closestMatch(element, VIEW_SELECTOR) !== null
+    }
+
+    function closestMatch(element, selector) {
+      let node = element
+      while (node && node.nodeType === 1) {
+        if (node.matches(selector)) return node
+        node = node.parentElement
+      }
+      return null
     }
 
     function apply(ctx) {
@@ -78,18 +182,26 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const state = { enabled: true, disposed: false, observer: null }
+      const state = { enabled: true, disposed: false }
       // Plugin panels may render their whole UI inside a same-origin iframe
       // (dsh-mcp-connector does: <iframe src="/mcp-connector/ui/">). Those
       // documents are invisible to the top-document observer, so watch every
       // same-origin frame document as well.
       const frameObservers = new Map()
       const frameListeners = new WeakSet()
+      // Markers back up the in-memory bookkeeping: nodes and elements outlive
+      // nothing, but a plugin that re-renders can hand back the very same text,
+      // and the marker says whether this plugin already wrote it.
       const textApplied = new WeakMap()
       const attrApplied = new WeakMap()
       const timers = new WeakMap()
+      // Translations are remembered for the lifetime of the page, per document:
+      // a remount or a re-scan walks the whole tree again, and the same words
+      // must never be paid for twice.
       const cache = new Map()
       const queue = new Map()
+      const pending = []
+      let deferTimer = null
       let flushTimer = null
       let flushing = false
 
@@ -102,35 +214,60 @@ window.__ModuleLoader__.load({
       }
 
       function insideConversationView(element) {
-        const view = element.closest(VIEW_SELECTOR)
+        const view = closestMatch(element, VIEW_SELECTOR)
         if (view === null) return false
         return view.querySelector(CONVERSATION_CONTENT) !== null
       }
 
+      // null when the element is not in the chat flow at all; otherwise says
+      // whether the row it belongs to must stay untranslated. User rows, steering
+      // messages, the optimistic submission echo and tool output are user data.
+      function chatRowExcluded(element) {
+        if (closestMatch(element, CHAT_FLOW_SELECTOR) === null) return null
+        const row = closestMatch(element, CHAT_ROW_SELECTOR)
+        if (row === null) return true
+        const kind = row.getAttribute('data-chat-flow-kind') || ''
+        if (CHAT_EXCLUDED_KINDS.has(kind)) return true
+        if (closestMatch(element, '[data-submission-echo]') !== null) return true
+        return false
+      }
+
       function isIgnored(element) {
         if (!element || element.nodeType !== 1) return true
-        if (element.closest(SKIP_SELECTOR) !== null) return true
-        if (element.closest(EXCLUDE_SELECTOR) !== null) return true
-        return insideConversationView(element)
+        if (closestMatch(element, SKIP_SELECTOR) !== null) return true
+        const chat = chatRowExcluded(element)
+        if (chat !== null) return chat
+        if (isStatusRow(element)) return false
+        if (insideConversationView(element)) return true
+        return closestMatch(element, EXCLUDE_SELECTOR) !== null
       }
 
       function isAttributeIgnored(element) {
         if (!element || element.nodeType !== 1) return true
-        if (element.closest(ATTRIBUTE_SKIP_SELECTOR) !== null) return true
-        if (element.closest(EXCLUDE_SELECTOR) !== null) return true
-        return insideConversationView(element)
+        if (closestMatch(element, ATTRIBUTE_SKIP_SELECTOR) !== null) return true
+        const chat = chatRowExcluded(element)
+        if (chat !== null) return chat
+        if (isStatusRow(element)) return false
+        if (insideConversationView(element)) return true
+        return closestMatch(element, EXCLUDE_SELECTOR) !== null
+      }
+
+      function textValue(node) {
+        const value = node.nodeValue
+        if (textApplied.get(node) === value) return ''
+        const core = wordsOf(value)
+        if (!core || core.length > MAX_LENGTH || !CJK.test(core)) return ''
+        return core
       }
 
       function applyText(node, original, translated) {
-        const { lead, trail } = splitWhitespace(original)
-        const next = lead + translated + trail
+        const next = restoreMarker(original, translated)
         textApplied.set(node, next)
         if (node.nodeValue !== next) node.nodeValue = next
       }
 
       function applyAttribute(element, name, original, translated) {
-        const { lead, trail } = splitWhitespace(original)
-        const next = lead + translated + trail
+        const next = restoreMarker(original, translated)
         let applied = attrApplied.get(element)
         if (!applied) {
           applied = Object.create(null)
@@ -141,12 +278,12 @@ window.__ModuleLoader__.load({
       }
 
       function enqueue(entry) {
-        let entries = queue.get(entry.core)
-        if (!entries) {
-          entries = []
-          queue.set(entry.core, entries)
+        let item = queue.get(entry.core)
+        if (!item) {
+          item = { entries: [] }
+          queue.set(entry.core, item)
         }
-        entries.push(entry)
+        item.entries.push(entry)
         if (!flushTimer) flushTimer = setTimeout(flush, BATCH_DELAY)
       }
 
@@ -165,15 +302,12 @@ window.__ModuleLoader__.load({
 
       function scheduleText(node) {
         if (!state.enabled || state.disposed || !node.isConnected) return
-        const value = node.nodeValue
-        if (!value || value.length > MAX_LENGTH || !CJK.test(value)) return
-        if (textApplied.get(node) === value) return
+        const core = textValue(node)
+        if (!core) return
         if (isIgnored(node.parentElement)) return
-        const { core } = splitWhitespace(value)
-        if (!core || core.length > MAX_LENGTH) return
         const cached = cache.get(core)
         if (cached) {
-          applyText(node, value, cached)
+          applyText(node, node.nodeValue, cached)
           return
         }
         const previousTimer = timers.get(node)
@@ -183,8 +317,16 @@ window.__ModuleLoader__.load({
           setTimeout(() => {
             timers.delete(node)
             if (!state.enabled || state.disposed) return
-            if (!node.isConnected || node.nodeValue !== value) return
-            enqueue({ kind: 'text', node, original: value, core })
+            // The status line rewrites its own words while the model streams an
+            // update, so the node is read again here rather than trusted to
+            // still hold what it held before the debounce.
+            if (!node.isConnected || !textValue(node)) return
+            const current = wordsOf(node.nodeValue)
+            if (cache.has(current)) {
+              scheduleText(node)
+              return
+            }
+            enqueue({ kind: 'text', node, original: node.nodeValue, core: current })
           }, DEBOUNCE),
         )
       }
@@ -192,16 +334,17 @@ window.__ModuleLoader__.load({
       function scanAttributes(element) {
         if (!state.enabled || state.disposed) return
         if (!element || element.nodeType !== 1 || isAttributeIgnored(element)) return
+        let applied = attrApplied.get(element)
         for (const name of ATTRIBUTES) {
           const value = element.getAttribute(name)
-          if (!value || value.length > MAX_LENGTH || !CJK.test(value)) continue
-          const applied = attrApplied.get(element)
+          if (!value) continue
           if (applied && applied[name] === value) continue
-          const { core } = splitWhitespace(value)
-          if (!core) continue
+          const core = wordsOf(value)
+          if (!core || core.length > MAX_LENGTH || !CJK.test(core)) continue
           const cached = cache.get(core)
           if (cached) {
             applyAttribute(element, name, value, cached)
+            applied = attrApplied.get(element)
             continue
           }
           enqueue({ kind: 'attribute', element, name, original: value, core })
@@ -220,19 +363,12 @@ window.__ModuleLoader__.load({
           return
         }
         if (root.nodeName === 'SCRIPT' || root.nodeName === 'STYLE') return
-        if (isIgnored(root)) {
-          if (root.matches && root.matches('input,textarea')) scanAttributes(root)
-          return
-        }
+        if (isIgnored(root)) return
 
         scanAttributes(root)
 
-        const ownerDocument = root.ownerDocument || document
-        const walker = ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT)
-        let node = walker.nextNode()
-        while (node) {
+        for (const node of collectTexts(root, [])) {
           if (!isIgnored(node.parentElement)) scheduleText(node)
-          node = walker.nextNode()
         }
 
         if (root.querySelectorAll) {
@@ -254,16 +390,44 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // A same-document navigation (the iframe panel routes between pages)
+      // replaces the document. The old one is dead, and keeping its entry would
+      // make every later mount look already-watched.
+      function watchReplacedDocument(frame) {
+        try {
+          if (!frame.isConnected) return
+          const doc = isAccessibleFrame(frame)
+          if (!doc) return
+          const known = frameObservers.get(doc)
+          if (known) return
+          for (const [watched, observer] of frameObservers) {
+            if (watched === doc) continue
+            let same = false
+            try {
+              same = watched.defaultView === doc.defaultView
+            } catch {
+              same = false
+            }
+            if (!same) continue
+            observer.disconnect()
+            frameObservers.delete(watched)
+          }
+          watchDocument(doc)
+        } catch {
+          // Unreadable frame: nothing to watch.
+        }
+      }
+
       function watchFrame(frame) {
         if (!frame || frame.nodeName !== 'IFRAME' || state.disposed) return
-        const doc = isAccessibleFrame(frame)
-        if (doc) watchDocument(doc)
+        // Checked on every call, not only when the frame first appears: the
+        // document may have been replaced since, by a route change inside it.
+        watchReplacedDocument(frame)
         if (frameListeners.has(frame)) return
         frameListeners.add(frame)
         frame.addEventListener('load', () => {
           if (state.disposed) return
-          const loaded = isAccessibleFrame(frame)
-          if (loaded) watchDocument(loaded)
+          watchReplacedDocument(frame)
         })
       }
 
@@ -292,8 +456,8 @@ window.__ModuleLoader__.load({
         if (flushing || !state.enabled || state.disposed || queue.size === 0) return
         flushing = true
         const batch = []
-        for (const [core, entries] of queue) {
-          batch.push({ core, entries })
+        for (const [core, item] of queue) {
+          batch.push({ core, entries: item.entries })
           queue.delete(core)
           if (batch.length >= MAX_BATCH) break
         }
@@ -314,17 +478,44 @@ window.__ModuleLoader__.load({
         }
       }
 
+      // One timer for the whole plugin: a burst of mutations is handled once,
+      // after the DOM has settled.
+      function defer(task) {
+        pending.push(task)
+        if (deferTimer) return
+        deferTimer = setTimeout(() => {
+          deferTimer = null
+          const tasks = pending.slice()
+          pending.length = 0
+          for (const item of tasks) item()
+        }, 0)
+      }
+
       function handleRecords(records) {
         if (!state.enabled || state.disposed) return
+        // Every write lands in the queue first and is acted on once. Walking a
+        // subtree or translating one text node makes the DOM change again, and
+        // this plugin's own mutations must not send it round a second time:
+        // reading what changed is fine, doing it twice is not.
+        const touched = []
         for (const record of records) {
           if (record.type === 'characterData') {
-            scheduleText(record.target)
+            touched.push(record.target)
           } else if (record.type === 'attributes') {
             scanAttributes(record.target)
           } else if (record.type === 'childList') {
-            for (const node of record.addedNodes) scan(node)
+            for (const node of record.addedNodes) touched.push(node)
           }
         }
+        if (touched.length === 0) return
+        defer(() => {
+          if (!state.enabled || state.disposed) return
+          for (const node of touched) {
+            if (!node.isConnected) continue
+            if (node.nodeType === 1) scan(node)
+            else if (node.nodeType === 3) scheduleText(node)
+          }
+        })
       }
 
       function scanEverything() {
